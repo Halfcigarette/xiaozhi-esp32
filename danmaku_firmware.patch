@@ -1,0 +1,410 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 0af71cd..af9bc1a 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -33,6 +33,8 @@ set(SOURCES "audio/audio_codec.cc"
+             "protocols/mqtt_protocol.cc"
+             "protocols/websocket_protocol.cc"
+             "mcp_server.cc"
++            "boards/common/danmaku_mcp_tool.cc"
++            "danmaku_tcp_server.cc"
+             "system_info.cc"
+             "application.cc"
+             "ota.cc"
+diff --git a/main/application.cc b/main/application.cc
+index fdd96fd..49efc58 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -1,3 +1,5 @@
++#include <deque>
++#include <mutex>
+ #include "application.h"
+ #include "assets.h"
+ #include "assets/lang_config.h"
+@@ -714,6 +716,73 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
+ 
+ void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
+ 
++void Application::SetDanmakuEnabled(bool enabled, const std::string& mode) {
++    danmaku_enabled_ = enabled;
++    danmaku_mode_ = (mode == "direct") ? "direct" : "mcp";
++    if (enabled) {
++        DeviceState st = GetDeviceState();
++        if (st == kDeviceStateIdle) {
++            StartListening();
++        } else if (st == kDeviceStateListening) {
++            Schedule([this]() { InjectNextDanmaku(); });
++        }
++    } else {
++        if (GetDeviceState() == kDeviceStateListening) {
++            StopListening();
++        }
++    }
++    ESP_LOGI(TAG, "SetDanmakuEnabled: %d mode=%s", enabled, danmaku_mode_.c_str());
++}
++
++void Application::PushDanmaku(const std::string& user, const std::string& text) {
++    if (text.empty()) {
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lock(danmaku_mutex_);
++        if (danmaku_queue_.size() >= 50) {
++            danmaku_queue_.pop_front();
++        }
++        danmaku_queue_.push_back((user.empty() ? "" : ("【" + user + "】")) + text);
++    }
++    if (danmaku_enabled_ && GetDeviceState() == kDeviceStateListening) {
++        Schedule([this]() { InjectNextDanmaku(); });
++    }
++}
++
++// 云 MCP 模式下，设备不直接持有弹幕文本，只发一句"读取提示"，
++// 由云端 LLM 调用 get_danmaku 取回最新弹幕并朗读+回复。无需设备 IP，跨网络可用。
++static const char* kDanmakuNudgeText =
++    "【读取弹幕】请调用 get_danmaku 获取最新一条直播间弹幕，先原样朗读该弹幕内容，再给出你的回复。";
++
++void Application::InjectNextDanmaku() {
++    if (!danmaku_enabled_) {
++        return;
++    }
++    if (danmaku_mode_ == "direct") {
++        // 直连模式：取设备经 TCP(:12345) 收到的原始弹幕，当作用户输入注入
++        std::string text;
++        {
++            std::lock_guard<std::mutex> lock(danmaku_mutex_);
++            if (danmaku_queue_.empty()) {
++                return;
++            }
++            text = danmaku_queue_.front();
++            danmaku_queue_.pop_front();
++        }
++        if (protocol_) {
++            protocol_->SendUserText(text);
++            ESP_LOGI("Danmaku", "inject(direct): %s", text.c_str());
++        }
++        return;
++    }
++    // 云 MCP 模式（默认）：发送 nudge，由 LLM 经 get_danmaku 拉取弹幕
++    if (protocol_) {
++        protocol_->SendUserText(kDanmakuNudgeText);
++        ESP_LOGI("Danmaku", "inject(mcp nudge)");
++    }
++}
++
+ void Application::HandleToggleChatEvent() {
+     auto state = GetDeviceState();
+ 
+@@ -955,6 +1024,9 @@ void Application::HandleStateChangedEvent() {
+                 } else {
+                     StartListeningAudio();
+                 }
++                if (danmaku_enabled_) {
++                    Schedule([this]() { InjectNextDanmaku(); });
++                }
+             } else {
+                 ConfigureWakeWordForListening();
+             }
+diff --git a/main/application.h b/main/application.h
+index 9d828ca..1b50599 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -105,6 +105,12 @@ public:
+      */
+     void StopListening();
+ 
++    // 弹幕朗读：设备端通过 MCP 工具 self.set_danmaku_enabled 控制开/关
++    void SetDanmakuEnabled(bool enabled, const std::string& mode = "mcp");
++    void PushDanmaku(const std::string& user, const std::string& text);
++    bool IsDanmakuEnabled() const { return danmaku_enabled_; }
++    const std::string& GetDanmakuMode() const { return danmaku_mode_; }
++
+     void Reboot();
+     void WakeWordInvoke(const std::string& wake_word);
+     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
+@@ -134,6 +140,10 @@ private:
+     esp_timer_handle_t clock_timer_handle_ = nullptr;
+     DeviceStateMachine state_machine_;
+     ListeningMode listening_mode_ = kListeningModeAutoStop;
++    bool danmaku_enabled_ = false;
++    std::string danmaku_mode_ = "mcp";  // "mcp"(默认) 或 "direct"
++    std::deque<std::string> danmaku_queue_;
++    std::mutex danmaku_mutex_;
+     AecMode aec_mode_ = kAecOff;
+     std::string last_error_message_;
+     AudioService audio_service_;
+@@ -163,6 +173,7 @@ private:
+     void BeginWakeWordInvoke(const std::string& wake_word);
+     void ContinueWakeWordInvoke(const std::string& wake_word);
+     void StartListeningAudio();
++    void InjectNextDanmaku();
+     void ConfigureWakeWordForListening();
+ 
+     // Activation task (runs in background)
+diff --git a/main/boards/common/danmaku_mcp_tool.cc b/main/boards/common/danmaku_mcp_tool.cc
+new file mode 100644
+index 0000000..e49c200
+--- /dev/null
++++ b/main/boards/common/danmaku_mcp_tool.cc
+@@ -0,0 +1,61 @@
++#include "danmaku_mcp_tool.h"
++#include <esp_log.h>
++#include "application.h"
++#include "settings.h"
++
++static const char* TAG = "DanmakuMcpTool";
++
++DanmakuMcpTool::DanmakuMcpTool() : danmaku_enabled_(false) {
++}
++
++void DanmakuMcpTool::Initialize() {
++    Settings settings("vendor");
++    danmaku_enabled_ = settings.GetInt("danmaku_enabled", 0) != 0;
++    std::string mode = settings.GetString("danmaku_mode", "mcp");
++    danmaku_mode_ = (mode == "direct") ? "direct" : "mcp";
++
++    auto& mcp_server = McpServer::GetInstance();
++    mcp_server.AddTool("self.set_danmaku_enabled",
++        "开启或关闭朗读直播间弹幕。开启后，小智会按 mode 逐条朗读并对话式回复弹幕；关闭后恢复正常语音模式。\n"
++        "参数 enabled 为 true 时开始读取弹幕，为 false 时停止。\n"
++        "参数 mode(可选，默认 mcp)：\n"
++        "  - \"mcp\"   : 设备只发送读取提示(nudge)，弹幕内容由云端 LLM 调用 get_danmaku 取回，"
++        "无需知道设备 IP，最适合跨网络/动态 IP 场景（推荐）。\n"
++        "  - \"direct\": 设备经局域网 TCP(:12345) 收到 PC 转发器推送的原始弹幕并直接注入，"
++        "延迟最低，但要求 PC 与设备同局域网且知道设备 IP。",
++        PropertyList({
++            Property("enabled", kPropertyTypeBoolean),
++            Property("mode", kPropertyTypeString, std::string("mcp"))
++        }),
++        [this](const PropertyList& properties) -> ReturnValue {
++            return HandleSetDanmakuEnabled(properties);
++        });
++
++    ESP_LOGI(TAG, "DanmakuMcpTool initialized, enabled=%d mode=%s", danmaku_enabled_, danmaku_mode_.c_str());
++}
++
++bool DanmakuMcpTool::IsDanmakuEnabled() const {
++    return danmaku_enabled_;
++}
++
++ReturnValue DanmakuMcpTool::HandleSetDanmakuEnabled(const PropertyList& properties) {
++    bool enabled = properties["enabled"].value<bool>();
++    std::string mode = "mcp";
++    try {
++        mode = properties["mode"].value<std::string>();
++    } catch (...) {
++        mode = "mcp";
++    }
++    SetDanmakuEnabled(enabled, mode);
++    return true;
++}
++
++void DanmakuMcpTool::SetDanmakuEnabled(bool enabled, const std::string& mode) {
++    danmaku_enabled_ = enabled;
++    danmaku_mode_ = (mode == "direct") ? "direct" : "mcp";
++    Settings settings("vendor", true);
++    settings.SetInt("danmaku_enabled", enabled ? 1 : 0);
++    settings.SetString("danmaku_mode", danmaku_mode_);
++    Application::GetInstance().SetDanmakuEnabled(enabled, danmaku_mode_);
++    ESP_LOGI(TAG, "Danmaku enabled: %d mode: %s", enabled, danmaku_mode_.c_str());
++}
+diff --git a/main/boards/common/danmaku_mcp_tool.h b/main/boards/common/danmaku_mcp_tool.h
+new file mode 100644
+index 0000000..4171e8d
+--- /dev/null
++++ b/main/boards/common/danmaku_mcp_tool.h
+@@ -0,0 +1,24 @@
++#ifndef DANMAKU_MCP_TOOL_H
++#define DANMAKU_MCP_TOOL_H
++
++#include "mcp_server.h"
++#include "settings.h"
++
++// 弹幕朗读 MCP 工具：让小智通过语音指令开关"读取弹幕"
++// mode: "mcp"(默认) = 设备只发 nudge，弹幕内容由云端 LLM 经 get_danmaku 取回（免设备 IP）；
++//       "direct"     = 设备经 TCP(:12345) 收到原始弹幕，直接当作用户输入注入。
++class DanmakuMcpTool {
++public:
++    DanmakuMcpTool();
++    void Initialize();
++    bool IsDanmakuEnabled() const;
++    const std::string& GetDanmakuMode() const { return danmaku_mode_; }
++
++private:
++    bool danmaku_enabled_ = false;
++    std::string danmaku_mode_ = "mcp";
++    void SetDanmakuEnabled(bool enabled, const std::string& mode = "mcp");
++    ReturnValue HandleSetDanmakuEnabled(const PropertyList& properties);
++};
++
++#endif // DANMAKU_MCP_TOOL_H
+diff --git a/main/boards/xmini/c3/xmini_c3_board.cc b/main/boards/xmini/c3/xmini_c3_board.cc
+index f9e7a93..378997f 100644
+--- a/main/boards/xmini/c3/xmini_c3_board.cc
++++ b/main/boards/xmini/c3/xmini_c3_board.cc
+@@ -9,6 +9,8 @@
+ #include "config.h"
+ #include "power_save_timer.h"
+ #include "press_to_talk_mcp_tool.h"
++#include "boards/common/danmaku_mcp_tool.h"
++#include "danmaku_tcp_server.h"
+ 
+ #include <esp_log.h>
+ #include <esp_efuse_table.h>
+@@ -27,6 +29,7 @@ private:
+     Button boot_button_;
+     PowerSaveTimer* power_save_timer_ = nullptr;
+     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
++    DanmakuMcpTool* danmaku_tool_ = nullptr;
+ 
+     void InitializePowerSaveTimer() {
+         power_save_timer_ = new PowerSaveTimer(160, 300);
+@@ -167,6 +170,11 @@ private:
+     void InitializeTools() {
+         press_to_talk_tool_ = new PressToTalkMcpTool();
+         press_to_talk_tool_->Initialize();
++
++        // 弹幕朗读：注册 self.set_danmaku_enabled MCP 工具 + 启动设备端 TCP 服务(端口12345)
++        danmaku_tool_ = new DanmakuMcpTool();
++        danmaku_tool_->Initialize();
++        danmaku::StartDanmakuServer(12345);
+     }
+ 
+ public:
+diff --git a/main/danmaku_tcp_server.cc b/main/danmaku_tcp_server.cc
+new file mode 100644
+index 0000000..03be560
+--- /dev/null
++++ b/main/danmaku_tcp_server.cc
+@@ -0,0 +1,84 @@
++#include "danmaku_tcp_server.h"
++#include <cstring>
++#include <string>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <cJSON.h>
++#include <esp_log.h>
++#include "application.h"
++
++static const char* TAG = "DanmakuTCP";
++
++static void danmaku_server_task(void* arg) {
++    int port = (int)(intptr_t)arg;
++    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (server_fd < 0) {
++        ESP_LOGE(TAG, "socket() failed");
++        return;
++    }
++    int opt = 1;
++    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++
++    struct sockaddr_in addr {};
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = INADDR_ANY;
++    addr.sin_port = htons((uint16_t)port);
++    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
++        ESP_LOGE(TAG, "bind() to port %d failed", port);
++        close(server_fd);
++        return;
++    }
++    listen(server_fd, 1);
++    ESP_LOGI(TAG, "danmaku tcp server listening on port %d", port);
++
++    while (true) {
++        int client_fd = accept(server_fd, nullptr, nullptr);
++        if (client_fd < 0) {
++            continue;
++        }
++        ESP_LOGI(TAG, "client connected");
++        char buf[512];
++        std::string line;
++        ssize_t n;
++        while ((n = read(client_fd, buf, sizeof(buf) - 1)) > 0) {
++            buf[n] = 0;
++            line += buf;
++            size_t lf;
++            while ((lf = line.find('\n')) != std::string::npos) {
++                std::string msg = line.substr(0, lf);
++                line.erase(0, lf + 1);
++                cJSON* root = cJSON_Parse(msg.c_str());
++                if (!root) {
++                    continue;
++                }
++                cJSON* cmd = cJSON_GetObjectItem(root, "cmd");
++                if (cmd && cJSON_IsString(cmd)) {
++                    if (strcmp(cmd->valuestring, "danmaku") == 0) {
++                        cJSON* user = cJSON_GetObjectItem(root, "user");
++                        cJSON* text = cJSON_GetObjectItem(root, "text");
++                        if (text && cJSON_IsString(text)) {
++                            std::string u = (user && cJSON_IsString(user)) ? user->valuestring : "";
++                            Application::GetInstance().PushDanmaku(u, text->valuestring);
++                        }
++                    } else if (strcmp(cmd->valuestring, "enable") == 0) {
++                        cJSON* value = cJSON_GetObjectItem(root, "value");
++                        if (value) {
++                            Application::GetInstance().SetDanmakuEnabled(value->valueint != 0);
++                        }
++                    }
++                }
++                cJSON_Delete(root);
++            }
++        }
++        close(client_fd);
++        ESP_LOGI(TAG, "client disconnected");
++    }
++}
++
++void danmaku::StartDanmakuServer(int port) {
++    xTaskCreate(danmaku_server_task, "danmaku_tcp", 8192, (void*)(intptr_t)port, 5, nullptr);
++}
+diff --git a/main/danmaku_tcp_server.h b/main/danmaku_tcp_server.h
+new file mode 100644
+index 0000000..8625038
+--- /dev/null
++++ b/main/danmaku_tcp_server.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++namespace danmaku {
++
++// 设备端 TCP 服务：监听 port，接收 PC 转发器发来的弹幕与开关指令。
++// 协议（每行一条 JSON，以 \n 分隔）：
++//   {"cmd":"danmaku","user":"昵称","text":"内容"}  -> 入队并触发朗读
++//   {"cmd":"enable","value":true|false}            -> 开关弹幕朗读
++void StartDanmakuServer(int port = 12345);
++
++} // namespace danmaku
+diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
+index f57720d..c79b3c5 100644
+--- a/main/protocols/protocol.cc
++++ b/main/protocols/protocol.cc
+@@ -71,6 +71,13 @@ void Protocol::SendWakeWordDetected(const std::string& wake_word) {
+     SendText(json);
+ }
+ 
++void Protocol::SendUserText(const std::string& text) {
++    std::string json = "{\"session_id\":\"" + session_id_ +
++                       "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + text +
++                       "\"}";
++    SendText(json);
++}
++
+ void Protocol::SendStartListening(ListeningMode mode) {
+     std::string message = "{\"session_id\":\"" + session_id_ + "\"";
+     message += ",\"type\":\"listen\",\"state\":\"start\"";
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index 988f1fe..f32b0bb 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -60,6 +60,7 @@ public:
+     virtual bool IsAudioChannelOpened() const = 0;
+     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
+     virtual void SendWakeWordDetected(const std::string& wake_word);
++    virtual void SendUserText(const std::string& text);
+     virtual void SendStartListening(ListeningMode mode);
+     virtual void SendStopListening();
+     virtual void SendAbortSpeaking(AbortReason reason);
