@@ -1,0 +1,64 @@
+# 虾哥 Mini C3 弹幕固件专用构建工作流（自包含版）
+# 用法（纯网页，无需本地 git / ESP-IDF）：
+#   1. 打开 https://github.com/78/xiaozhi-esp32 ，点右上角 Fork 到自己账号。
+#   2. 在 fork 仓库里：
+#        - Add file → Create new file，路径填  .github/workflows/build-xmini-c3.yml ，内容粘贴本文件；
+#        - Add file → Upload files，上传同目录下的  danmaku_firmware.patch  到仓库根目录。
+#   3. 提交后，进入仓库 Actions 标签页，选中本工作流，点 Run workflow。
+#   4. 等约 15~20 分钟，构建完成后在 Artifacts 里下载
+#        xiaozhi_xmini-c3_danmaku_bin（merged-binary.bin）或
+#        xiaozhi_xmini-c3_danmaku_zip（releases/*.zip）即可。
+# 工作流会自动 clone 上游官方代码、应用弹幕补丁、用 ESP-IDF v6.0.2 编译。
+name: Build xmini-c3 (danmaku)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build xmini-c3 danmaku firmware
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.2
+    steps:
+      - name: Checkout this repo (to fetch the patch file)
+        uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      - name: Clone upstream xiaozhi-esp32 (with submodules)
+        shell: bash
+        run: |
+          git clone --recursive https://github.com/78/xiaozhi-esp32.git src
+
+      - name: Apply danmaku patch
+        shell: bash
+        run: |
+          cd src
+          git apply ../patchrepo/danmaku_firmware.patch
+          echo "patch applied, files changed:"
+          git status --short | head
+
+      - name: Build xmini/c3 with danmaku patch
+        shell: bash
+        run: |
+          cd src
+          source $IDF_PATH/export.sh
+          python scripts/build.py xmini/c3 --name xmini-c3 --zip
+
+      - name: Upload merged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi_xmini-c3_danmaku_bin
+          path: src/build/merged-binary.bin
+          if-no-files-found: error
+
+      - name: Upload release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaozhi_xmini-c3_danmaku_zip
+          path: src/releases/*.zip
+          if-no-files-found: error
