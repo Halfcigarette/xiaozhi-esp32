@@ -143,14 +143,15 @@ index 9d828ca..1b50599 100644
      // Activation task (runs in background)
 diff --git a/main/boards/common/danmaku_mcp_tool.cc b/main/boards/common/danmaku_mcp_tool.cc
 new file mode 100644
-index 0000000..e49c200
+index 0000000..8b203a9
 --- /dev/null
 +++ b/main/boards/common/danmaku_mcp_tool.cc
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,72 @@
 +#include "danmaku_mcp_tool.h"
 +#include <esp_log.h>
 +#include "application.h"
 +#include "settings.h"
++#include "danmaku_tcp_server.h"
 +
 +static const char* TAG = "DanmakuMcpTool";
 +
@@ -206,6 +207,16 @@ index 0000000..e49c200
 +    settings.SetInt("danmaku_enabled", enabled ? 1 : 0);
 +    settings.SetString("danmaku_mode", danmaku_mode_);
 +    Application::GetInstance().SetDanmakuEnabled(enabled, danmaku_mode_);
++
++    // 懒启动设备端 TCP 服务（仅 direct 模式需要）：
++    // 不在开机时启动，因为此时 LWIP tcpip 线程尚未就绪，socket() 会触发 Invalid mbox 断言崩溃；
++    // 此处由语音指令"读取弹幕"触发，彼时设备已连上 xiaozhi 云，网络栈必然已就绪。
++    static bool server_started = false;
++    if (enabled && danmaku_mode_ == "direct" && !server_started) {
++        danmaku::StartDanmakuServer(12345);
++        server_started = true;
++        ESP_LOGI(TAG, "Danmaku TCP server started on :12345 (direct mode)");
++    }
 +    ESP_LOGI(TAG, "Danmaku enabled: %d mode: %s", enabled, danmaku_mode_.c_str());
 +}
 diff --git a/main/boards/common/danmaku_mcp_tool.h b/main/boards/common/danmaku_mcp_tool.h
@@ -239,7 +250,7 @@ index 0000000..4171e8d
 +
 +#endif // DANMAKU_MCP_TOOL_H
 diff --git a/main/boards/xmini/c3/xmini_c3_board.cc b/main/boards/xmini/c3/xmini_c3_board.cc
-index f9e7a93..378997f 100644
+index f9e7a93..c399cc0 100644
 --- a/main/boards/xmini/c3/xmini_c3_board.cc
 +++ b/main/boards/xmini/c3/xmini_c3_board.cc
 @@ -9,6 +9,8 @@
@@ -259,15 +270,17 @@ index f9e7a93..378997f 100644
  
      void InitializePowerSaveTimer() {
          power_save_timer_ = new PowerSaveTimer(160, 300);
-@@ -167,6 +170,11 @@ private:
+@@ -167,6 +170,13 @@ private:
      void InitializeTools() {
          press_to_talk_tool_ = new PressToTalkMcpTool();
          press_to_talk_tool_->Initialize();
 +
-+        // 弹幕朗读：注册 self.set_danmaku_enabled MCP 工具 + 启动设备端 TCP 服务(端口12345)
++        // 弹幕朗读：注册 self.set_danmaku_enabled MCP 工具
++        // 注意：设备端 TCP 服务(danmaku::StartDanmakuServer, 端口12345) 不在开机时启动，
++        // 改由 DanmakuMcpTool::SetDanmakuEnabled 在首次开启弹幕(direct 模式)时懒启动——
++        // 避免开机早期 LWIP tcpip 线程尚未就绪，socket() 触发 Invalid mbox 断言崩溃。
 +        danmaku_tool_ = new DanmakuMcpTool();
 +        danmaku_tool_->Initialize();
-+        danmaku::StartDanmakuServer(12345);
      }
  
  public:
