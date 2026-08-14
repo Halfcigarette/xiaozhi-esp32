@@ -395,13 +395,24 @@ diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
 index f57720d..c79b3c5 100644
 --- a/main/protocols/protocol.cc
 +++ b/main/protocols/protocol.cc
-@@ -71,6 +71,13 @@ void Protocol::SendWakeWordDetected(const std::string& wake_word) {
+@@ -71,6 +71,24 @@ void Protocol::SendWakeWordDetected(const std::string& wake_word) {
      SendText(json);
  }
  
 +void Protocol::SendUserText(const std::string& text) {
++    // 转义特殊字符，避免弹幕含引号/换行/控制字符破坏整条 listen 帧（根源修复：
++    // 之前裸拼接导致服务端解析异常，并误报 "detect is only for wake words"）。
++    // 注：direct 模式弹幕仍走 listen/detect（唤醒语义），服务端对 detect 有长度限制，
++    // 正常几十字弹幕不受影响；超长内容请改用 MCP 模式（默认），由云端 LLM 取回朗读。
++    std::string safe;
++    for (char c : text) {
++        if (c == '"' || c == '\\') { safe += '\\'; safe += c; }
++        else if (c == '\n' || c == '\r' || c == '\t') { safe += ' '; }
++        else if ((unsigned char)c < 0x20) { /* 丢弃控制字符 */ }
++        else { safe += c; }
++    }
 +    std::string json = "{\"session_id\":\"" + session_id_ +
-+                       "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + text +
++                       "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + safe +
 +                       "\"}";
 +    SendText(json);
 +}
@@ -409,6 +420,7 @@ index f57720d..c79b3c5 100644
  void Protocol::SendStartListening(ListeningMode mode) {
      std::string message = "{\"session_id\":\"" + session_id_ + "\"";
      message += ",\"type\":\"listen\",\"state\":\"start\"";
+
 diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
 index 988f1fe..f32b0bb 100644
 --- a/main/protocols/protocol.h
