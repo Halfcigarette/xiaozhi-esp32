@@ -12,7 +12,7 @@ index 0af71cd..af9bc1a 100644
              "application.cc"
              "ota.cc"
 diff --git a/main/application.cc b/main/application.cc
-index fdd96fd..de9979a 100644
+index fdd96fd..3d79f21 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -1,3 +1,5 @@
@@ -21,7 +21,7 @@ index fdd96fd..de9979a 100644
  #include "application.h"
  #include "assets.h"
  #include "assets/lang_config.h"
-@@ -714,6 +716,99 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
+@@ -714,6 +716,97 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
  
  void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
  
@@ -61,16 +61,14 @@ index fdd96fd..de9979a 100644
 +
 +// 云 MCP 模式下，设备不直接持有弹幕文本，只发一句"读取提示"(nudge)，
 +// 由云端 LLM 调用 get_danmaku 取回最新弹幕并朗读+回复。无需设备 IP，跨网络可用。
-+// 注意：nudge 必须尽量短——它经 listen/detect 发给云端，过长可能触发
-+// 云端 "detect is only for wake words, do not send long texts" 的拦截。
++// 注意：nudge 经 chat 通道发给云端（不是 listen/detect 唤醒词通道），无唤醒词长度限制。
 +static const char* kDanmakuNudgeText =
 +    "【读取弹幕】调用get_danmaku读取最新一条弹幕，原样朗读后回复。";
 +
-+// 直连(direct)模式下原始弹幕经 listen/detect 直发云端，云端对 detect 文本有长度限制，
-+// 超过会被拒并报 "detect is only for wake words, do not send long texts"。
-+// 固件侧按 UTF-8 字符数截断（超长加"…"），避免报错；
-+// 若需原样朗读长弹幕，请改用 MCP 模式（默认，由云端 get_danmaku 取回，无长度限制）。
-+static const size_t kDanmakuMaxInjectChars = 60;
++// 直连(direct)模式下原始弹幕经 chat 通道直接发给云端 LLM（无 listen/detect 唤醒词长度限制）。
++// 这里仍按 UTF-8 字符数做一道宽松截断（超长加"…"），仅作为 TTS 时长的安全兜底，
++// 避免单条超长弹幕朗读过久；正常直播间弹幕远不会触达此上限。
++static const size_t kDanmakuMaxInjectChars = 200;
 +
 +// 按 UTF-8 字符（而非字节）截断，避免截断在多字节字符中间导致乱码。
 +static std::string TruncateUtf8(const std::string& s, size_t max_chars) {
@@ -99,21 +97,21 @@ index fdd96fd..de9979a 100644
 +            text = danmaku_queue_.front();
 +            danmaku_queue_.pop_front();
 +        }
-+        // 直连模式把原始弹幕直发云端，云端对 detect 文本有长度限制，超长会被拒；
-+        // 固件侧按字符数截断（超出加"…"），避免报 "detect is only for wake words"。
++        // 直连模式把原始弹幕经 chat 通道直发云端 LLM（无唤醒词长度限制）。
++        // 固件侧仍按字符数做宽松截断（超出加"…"），仅作 TTS 时长安全兜底。
 +        std::string injected = TruncateUtf8(text, kDanmakuMaxInjectChars);
 +        if (injected.size() < text.size()) {
 +            injected += "…";
 +        }
 +        if (protocol_) {
-+            protocol_->SendUserText(injected);
++            protocol_->SendUserChatText(injected);
 +            ESP_LOGI("Danmaku", "inject(direct): %s", injected.c_str());
 +        }
 +        return;
 +    }
-+    // 云 MCP 模式（默认）：发送 nudge，由 LLM 经 get_danmaku 拉取弹幕
++    // 云 MCP 模式（默认）：经 chat 通道发送 nudge，由 LLM 经 get_danmaku 拉取弹幕
 +    if (protocol_) {
-+        protocol_->SendUserText(kDanmakuNudgeText);
++        protocol_->SendUserChatText(kDanmakuNudgeText);
 +        ESP_LOGI("Danmaku", "inject(mcp nudge)");
 +    }
 +}
@@ -121,17 +119,15 @@ index fdd96fd..de9979a 100644
  void Application::HandleToggleChatEvent() {
      auto state = GetDeviceState();
  
-@@ -944,6 +1039,19 @@ void Application::HandleStateChangedEvent() {
+@@ -944,6 +1037,17 @@ void Application::HandleStateChangedEvent() {
              display->SetStatus(Lang::Strings::LISTENING);
              display->SetEmotion("neutral");
  
 +            if (danmaku_enabled_) {
-+                // 弹幕朗读模式：关键修复——【不开麦】。
-+                // 若在此发送 listen/start（开麦），云端会处于"正在听音频"会话中，
-+                // 随后发出的 listen/detect 文本会被误判为唤醒词事件，
-+                // 报 "detect is only for wake words, do not send long texts"，且循环会断。
-+                // 因此只启用本地唤醒词检测（方便随时语音打断），并注入下一条弹幕(nudge)，
-+                // 由云端 LLM 经 get_danmaku 取回弹幕朗读，形成持续循环。
++                // 弹幕朗读模式：不开麦（不发送 listen/start），只启用本地唤醒词检测，
++                // 方便随时语音打断退出弹幕模式；并注入下一条弹幕（经 chat 通道发给云端 LLM）。
++                // 弹幕文本走 chat 通道（非 listen/detect 唤醒词通道），云端不会因长度/唤醒词而拒，
++                // 朗读完→tts-stop→回到 Listening→再次注入，形成持续循环。
 +                audio_service_.EnableVoiceProcessing(true);
 +                ConfigureWakeWordForListening();
 +                Schedule([this]() { InjectNextDanmaku(); });
@@ -428,16 +424,43 @@ index 0000000..8625038
 +
 +} // namespace danmaku
 diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
-index f57720d..c79b3c5 100644
+index f57720d..90ccafb 100644
 --- a/main/protocols/protocol.cc
 +++ b/main/protocols/protocol.cc
-@@ -71,6 +71,13 @@ void Protocol::SendWakeWordDetected(const std::string& wake_word) {
+@@ -71,6 +71,40 @@ void Protocol::SendWakeWordDetected(const std::string& wake_word) {
      SendText(json);
  }
  
++// 转义 JSON 字符串中的特殊字符，避免弹幕里的引号/换行/反斜杠破坏协议 JSON。
++static std::string JsonEscape(const std::string& s) {
++    std::string out;
++    out.reserve(s.size());
++    for (char c : s) {
++        switch (c) {
++            case '"':  out += "\\\""; break;
++            case '\\': out += "\\\\"; break;
++            case '\n': out += "\\n";  break;
++            case '\r': out += "\\r";  break;
++            case '\t': out += "\\t";  break;
++            default:   out += c;      break;
++        }
++    }
++    return out;
++}
++
 +void Protocol::SendUserText(const std::string& text) {
 +    std::string json = "{\"session_id\":\"" + session_id_ +
-+                       "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + text +
++                       "\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"" + JsonEscape(text) +
++                       "\"}";
++    SendText(json);
++}
++
++// 把一段自由文本当作"用户输入"直接交给云端 LLM（走 chat 通道，而非 listen/detect 唤醒词通道）。
++// chat 是 xiaozhi 服务端正确的用户文本输入通道（chat -> startToChat -> LLM），
++// 没有 listen/detect 那样的长度/唤醒词限制，适合朗读直播弹幕这类较长文本。
++void Protocol::SendUserChatText(const std::string& text) {
++    std::string json = "{\"session_id\":\"" + session_id_ +
++                       "\",\"type\":\"chat\",\"text\":\"" + JsonEscape(text) +
 +                       "\"}";
 +    SendText(json);
 +}
@@ -446,14 +469,15 @@ index f57720d..c79b3c5 100644
      std::string message = "{\"session_id\":\"" + session_id_ + "\"";
      message += ",\"type\":\"listen\",\"state\":\"start\"";
 diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
-index 988f1fe..f32b0bb 100644
+index 988f1fe..0fed0df 100644
 --- a/main/protocols/protocol.h
 +++ b/main/protocols/protocol.h
-@@ -60,6 +60,7 @@ public:
+@@ -60,6 +60,8 @@ public:
      virtual bool IsAudioChannelOpened() const = 0;
      virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
      virtual void SendWakeWordDetected(const std::string& wake_word);
 +    virtual void SendUserText(const std::string& text);
++    virtual void SendUserChatText(const std::string& text);
      virtual void SendStartListening(ListeningMode mode);
      virtual void SendStopListening();
      virtual void SendAbortSpeaking(AbortReason reason);
