@@ -9,6 +9,7 @@
 #        xiaozhi_xmini-c3_danmaku_bin（merged-binary.bin）或
 #        xiaozhi_xmini-c3_danmaku_zip（releases/*.zip）即可。
 # 工作流会自动 clone 上游官方代码、应用弹幕补丁、用 ESP-IDF v6.0.2 编译。
+# 注：checkout/upload-artifact 已升到 Node 24 兼容版本（v5 / v6），不再有 Node 20 弃用警告。
 name: Build xmini-c3 (danmaku)
 
 on:
@@ -25,7 +26,7 @@ jobs:
       image: espressif/idf:v6.0.2
     steps:
       - name: Checkout this repo (to fetch the patch file)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: patchrepo
 
@@ -50,14 +51,14 @@ jobs:
           python scripts/build.py xmini/c3 --name xmini-c3 --zip
 
       - name: Upload merged binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: xiaozhi_xmini-c3_danmaku_bin
           path: src/build/merged-binary.bin
           if-no-files-found: error
 
       - name: Upload release zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: xiaozhi_xmini-c3_danmaku_zip
           path: src/releases/*.zip
