@@ -12,7 +12,7 @@ index 0af71cd..af9bc1a 100644
              "application.cc"
              "ota.cc"
 diff --git a/main/application.cc b/main/application.cc
-index fdd96fd..c4e7125 100644
+index fdd96fd..12c325d 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -1,8 +1,12 @@
@@ -218,7 +218,7 @@ index fdd96fd..c4e7125 100644
 +        SetDanmakuEnabled(false, danmaku_mode_);
 +        // 同步清掉 NVS 里的开关，避免与 DanmakuMcpTool 的持久化状态不一致
 +        Settings settings("vendor", true);
-+        settings.SetInt("danmaku_enabled", 0);
++        settings.SetInt("dmk_enabled", 0);
 +        auto display = Board::GetInstance().GetDisplay();
 +        display->SetChatMessage("system", "已退出弹幕朗读");
 +        return;
@@ -303,7 +303,7 @@ index 9d828ca..3a5c660 100644
      // Activation task (runs in background)
 diff --git a/main/boards/common/danmaku_mcp_tool.cc b/main/boards/common/danmaku_mcp_tool.cc
 new file mode 100644
-index 0000000..d669353
+index 0000000..acd46d2
 --- /dev/null
 +++ b/main/boards/common/danmaku_mcp_tool.cc
 @@ -0,0 +1,88 @@
@@ -320,10 +320,10 @@ index 0000000..d669353
 +
 +void DanmakuMcpTool::Initialize() {
 +    Settings settings("vendor");
-+    danmaku_enabled_ = settings.GetInt("danmaku_enabled", 0) != 0;
++    danmaku_enabled_ = settings.GetInt("dmk_enabled", 0) != 0;
 +    std::string mode = settings.GetString("danmaku_mode", "mcp");
 +    danmaku_mode_ = (mode == "direct") ? "direct" : "mcp";
-+    danmaku_delay_ms_ = settings.GetInt("danmaku_delay_ms", 1500);
++    danmaku_delay_ms_ = settings.GetInt("dmk_delay_ms", 1500);
 +
 +    auto& mcp_server = McpServer::GetInstance();
 +    mcp_server.AddTool("self.set_danmaku_enabled",
@@ -379,9 +379,9 @@ index 0000000..d669353
 +        danmaku_delay_ms_ = delay_ms;
 +    }
 +    Settings settings("vendor", true);
-+    settings.SetInt("danmaku_enabled", enabled ? 1 : 0);
++    settings.SetInt("dmk_enabled", enabled ? 1 : 0);
 +    settings.SetString("danmaku_mode", danmaku_mode_);
-+    settings.SetInt("danmaku_delay_ms", danmaku_delay_ms_);
++    settings.SetInt("dmk_delay_ms", danmaku_delay_ms_);
 +    Application::GetInstance().SetDanmakuEnabled(enabled, danmaku_mode_, danmaku_delay_ms_);
 +
 +    // 懒启动设备端 TCP 服务（仅 direct 模式需要）：
